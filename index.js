@@ -1,3 +1,4 @@
+//https://github.com/browserify/browserify
 var { createHash } = require("crypto");
 var { EventEmitter } = require("events");
 var fs = require("fs");
@@ -6,7 +7,13 @@ var path = require("path");
 var { Duplex, PassThrough, Readable, Transform, Writable } = require("stream");
 var { inherits } = require("util");
 
-module.exports = Browserify;
+
+module.exports = {
+    browserify: Browserify,
+    watchify,
+}
+
+
 
 //mjs maybe
 // import { createHash } from "crypto";
@@ -168,77 +175,136 @@ var defaultVars = {
     },
 };
 function insertModuleGlobals(file, opts) {
-    if (/\.json$/i.test(file))
-        return new PassThrough();
-    if (!opts)
-        opts = {};
-    var basedir = opts.basedir || "/";
-    var vars = {
-        ...defaultVars,
-        ...opts.vars,
-    };
-    var varNames = Object.keys(vars).filter(function (name) {
-        return typeof vars[name] === "function";
+if (/\.json$/i.test(file)) return through();
+if (!opts) opts = {};
+
+var basedir = opts.basedir || '/';
+var vars = Object.assign({}, defaultVars, opts.vars);
+var varNames = Object.keys(vars).filter(function(name) {
+    return typeof vars[name] === 'function';
+});
+
+var quick = RegExp(varNames.map(function (name) {
+    return '\\b' + name + '\\b';
+}).join('|'));
+
+var chunks = [];
+
+return through(write, end);
+
+function write (chunk, enc, next) { chunks.push(chunk); next() }
+
+function end () {
+    var self = this;
+    var source = Buffer.isBuffer(chunks[0])
+        ? Buffer.concat(chunks).toString('utf8')
+        : chunks.join('')
+    ;
+    source = source
+        .replace(/^\ufeff/, '')
+        .replace(/^#![^\n]*\n/, '\n');
+    
+    if (opts.always !== true && !quick.test(source)) {
+        this.push(source);
+        this.push(null);
+        return;
+    }
+    
+    // try {
+    //     var undeclared = opts.always
+    //         ? { identifiers: varNames, properties: [] }
+    //         : undeclaredIdentifiers(parse(source), { wildcard: true })
+    //     ;
+    // }
+
+    try {
+        var undeclared = { identifiers: varNames, properties: [] }
+        
+    }
+
+    catch (err) {
+        var e = new SyntaxError(
+            (err.message || err) + ' while parsing ' + file
+        );
+        e.type = 'syntax';
+        e.filename = file;
+        return this.emit('error', e);
+    }
+    
+    var globals = {};
+    
+    varNames.forEach(function (name) {
+        if (!/\./.test(name)) return;
+        var parts = name.split('.')
+        var prop = undeclared.properties.indexOf(name)
+        if (prop === -1 || countprops(undeclared.properties, parts[0]) > 1) return;
+        var value = vars[name](file, basedir);
+        if (!value) return;
+        globals[parts[0]] = '{'
+            + JSON.stringify(parts[1]) + ':' + value + '}';
+        self.emit('global', name);
     });
-    var quick = RegExp(varNames.map((name) => "\\b" + name + "\\b").join("|"));
-    var chunks = [];
-    return new Transform({
-        writableObjectMode: true,
-        objectMode: true,
-        write(chunk, enc, next) {
-            chunks.push(chunk);
-            next();
-        },
-        flush() {
-            var self = this;
-            var source = Buffer.isBuffer(chunks[0]) ? Buffer.concat(chunks).toString("utf8") : chunks.join("");
-            source = source.replace(/^\ufeff/, "").replace(/^#![^\n]*\n/, "\n");
-            if (opts.always !== true && !quick.test(source)) {
-                this.push(source);
-                this.push(null);
-                return;
-            }
-            try {
-                var undeclared = { identifiers: varNames, properties: [] };
-            }
-            catch (err) {
-                console.warn("[InsertModGlobals]: Error Parsing" + file);
-                var e = new SyntaxError((err.message || err) + " while parsing " + file);
-                e.type = "syntax";
-                e.filename = file;
-                return this.emit("error", e);
-            }
-            var globals = {};
-            varNames.forEach((name) => {
-                if (/\./.test(name))
-                    return;
-                if (globals[name])
-                    return;
-                if (undeclared.identifiers.indexOf(name) < 0)
-                    return;
-                var value = vars[name](file, basedir);
-                if (!value)
-                    return;
-                globals[name] = value;
-                self.emit("global", name);
-            });
-            var keys = Object.keys(globals);
-            if (keys.length === 0) {
-                this.push(source);
-                this.push(null);
-            }
-            else {
-                var values = keys.map((key) => globals[key]);
-                var extra = ["__argument0", "__argument1", "__argument2", "__argument3"];
-                var names = keys.slice(0, 3).concat(extra).concat(keys.slice(3));
-                values.splice(3, 0, "arguments[3]", "arguments[4]", "arguments[5]", "arguments[6]");
-                var wrapped = `((${names.join(",")}) => {(()=>{${source}}).call(this)}).call(this,${values.join(",")})`;
-                this.push(wrapped);
-                this.push(null);
-            }
-        },
+
+    varNames.forEach(function (name) {
+        if (/\./.test(name)) return;
+        if (globals[name]) return;
+        if (undeclared.identifiers.indexOf(name) < 0) return;
+        var value = vars[name](file, basedir);
+        if (!value) return;
+        globals[name] = value;
+        self.emit('global', name);
     });
+    
+    this.push(closeOver(globals, source, file, opts));
+    this.push(null);
 }
+};
+
+
+
+function closeOver (globals, src, file, opts) {
+var keys = Object.keys(globals);
+if (keys.length === 0) return src;
+var values = keys.map(function (key) { return globals[key] });
+
+// we double-wrap the source in IIFEs to prevent code like
+//     (function(Buffer){ const Buffer = null }())
+// which causes a parse error.
+var wrappedSource = '(function (){\n' + src + '\n}).call(this)';
+if (keys.length <= 3) {
+    wrappedSource = '(function (' + keys.join(',') + '){'
+        + wrappedSource + '}).call(this,' + values.join(',') + ')'
+    ;
+}
+else {
+  // necessary to make arguments[3..6] still work for workerify etc
+  // a,b,c,arguments[3..6],d,e,f...
+  var extra = [ '__argument0', '__argument1', '__argument2', '__argument3' ];
+  var names = keys.slice(0,3).concat(extra).concat(keys.slice(3));
+  values.splice(3, 0,
+      'arguments[3]','arguments[4]',
+      'arguments[5]','arguments[6]'
+  );
+  wrappedSource = '(function (' + names.join(',') + '){'
+    + wrappedSource + '}).call(this,' + values.join(',') + ')';
+}
+
+// Generate source maps if wanted. Including the right offset for
+// the wrapped source.
+
+    return wrappedSource;
+
+
+
+}
+
+function countprops (props, name) {
+return props.filter(function (prop) {
+    return prop.slice(0, name.length + 1) === name + '.';
+}).length;
+}
+
+
 var bpackPrelude = `(function () {
   function r(e, n, t) {
     function o(i, f) {
@@ -267,6 +333,7 @@ var bpackPrelude = `(function () {
   }
   return r;
 })();`;
+
 var commentRx = /^\s*\/(?:\/|\*)[@#]\s+sourceMappingURL=data:(?:application|text)\/json;(?:charset[:=]\S+;)?base64,(.*)$/gm;
 var mapFileCommentRx = /(?:\/\/[@#][ \t]+sourceMappingURL=([^\s'"]+?)[ \t]*$)|(?:\/\*[@#][ \t]+sourceMappingURL=([^\*]+?)[ \t]*(?:\*\/){1}[ \t]*$)/gm;
 function removeSourceMapComments(src) {
@@ -3138,3 +3205,305 @@ from2.obj = function obj(opts, read) {
     opts.highWaterMark = 16;
     return from2(opts, read);
 };
+
+
+
+
+
+
+
+//
+// ─── WATCHIFY ───────────────────────────────────────────────────────────────────
+//
+
+
+//https://github.com/fitzgen/glob-to-regexp/blob/master/index.js
+// type GlobOptions = Partial<{
+//   extended: boolean;
+//   globstar: boolean;
+//   flags: string;
+// }>;
+
+function GlobToRegExp(glob, opts) {
+  if (typeof glob !== "string") {
+    throw new TypeError("Expected a string");
+  }
+  var str = String(glob);
+  var reStr = "";
+  var extended = opts ? !!opts.extended : false;
+  //TLDR set to true to make dir/* only match 1 level deep
+  var globstar = opts ? !!opts.globstar : false;
+  var inGroup = false;
+  var flags = opts && typeof opts.flags === "string" ? opts.flags : "";
+
+  var c;
+  for (var i = 0, len = str.length; i < len; i++) {
+    c = str[i];
+
+    switch (c) {
+      case "/":
+      case "$":
+      case "^":
+      case "+":
+      case ".":
+      case "(":
+      case ")":
+      case "=":
+      case "!":
+      case "|":
+        reStr += "\\" + c;
+        break;
+
+      case "?":
+        if (extended) {
+          reStr += ".";
+          break;
+        }
+
+      case "[":
+      case "]":
+        if (extended) {
+          reStr += c;
+          break;
+        }
+
+      case "{":
+        if (extended) {
+          inGroup = true;
+          reStr += "(";
+          break;
+        }
+
+      case "}":
+        if (extended) {
+          inGroup = false;
+          reStr += ")";
+          break;
+        }
+
+      case ",":
+        if (inGroup) {
+          reStr += "|";
+          break;
+        }
+        reStr += "\\" + c;
+        break;
+
+      case "*":
+        var prevChar = str[i - 1];
+        var starCount = 1;
+        while (str[i + 1] === "*") {
+          starCount++;
+          i++;
+        }
+        var nextChar = str[i + 1];
+
+        if (!globstar) {
+          reStr += ".*";
+        } else {
+          var isGlobstar =
+            starCount > 1 &&
+            (prevChar === "/" || prevChar === undefined) &&
+            (nextChar === "/" || nextChar === undefined);
+
+          if (isGlobstar) {
+            reStr += "((?:[^/]*(?:/|$))*)";
+            i++;
+          } else {
+            reStr += "([^/]*)";
+          }
+        }
+        break;
+
+      default:
+        reStr += c;
+    }
+  }
+
+  if (!flags || !~flags.indexOf("g")) {
+    reStr = "^" + reStr + "$";
+  }
+
+  return new RegExp(reStr, flags);
+}
+
+
+const anymatch = (testGlob, actualFilepath) => {
+  return GlobToRegExp(testGlob).test(actualFilepath);
+};
+
+const depsTransform = (b, cache) => {
+  const _STREAM = new Transform({ objectMode: true });
+
+  _STREAM._transform = (row, enc, next) => {
+    var file = row.expose ? b._expose[row.id] : row.file;
+    cache[file] = {
+      source: row.source,
+      deps: Object.assign({}, row.deps),
+    };
+    _STREAM.push(row);
+    next();
+  };
+
+  return _STREAM;
+};
+
+const _wrapTransform = (b, time, bytes) => {
+  let _STREAM = new Transform();
+  _STREAM._transform = (buf, enc, next) => {
+    bytes += buf.length;
+    _STREAM.push(buf);
+    next();
+  };
+  _STREAM._flush = () => {
+    var delta = Date.now() - time;
+    b.emit("time", delta);
+    b.emit("bytes", bytes);
+    b.emit("log", bytes + " bytes written (" + (delta / 1000).toFixed(2) + " seconds)");
+    _STREAM.push(null);
+  };
+
+  return _STREAM;
+};
+
+function watchify(b, opts) {
+  if (!opts) opts = {};
+  var cache = b._options.cache;
+  var pkgcache = b._options.packageCache;
+  var delay = typeof opts.delay === "number" ? opts.delay : 100;
+  var changingDeps = {};
+  var pending = false;
+  var updating = false;
+
+  // unused atm, was a chokadir option, fs method also has this param b
+  var wopts = {
+    persistent: true,
+  };
+
+  var ignored = opts.ignoreWatch || "node_modules";
+
+  if (cache) {
+    b.on("reset", collect);
+    collect();
+  }
+  function collect() {
+    b.pipeline.get("deps").push(depsTransform(b, cache));
+  }
+
+  b.on("file", function (file) {
+    watchFile(file);
+  });
+
+  b.on("package", function (pkg) {
+    var file = path.join(pkg.__dirname, "package.json");
+    watchFile(file);
+    if (pkgcache) pkgcache[file] = pkg;
+  });
+
+  b.on("reset", reset);
+  reset();
+
+  function reset() {
+    var time = null;
+    var bytes = 0;
+    b.pipeline.get("record").on("end", () => {
+      time = Date.now();
+    });
+    b.pipeline.get("wrap").push(_wrapTransform(b, time, bytes));
+  }
+
+  var fwatchers = {};
+  var fwatcherFiles = {};
+  var ignoredFiles = {};
+
+  b.on("transform", (tr, mfile) => {
+    tr.on("file", (dep) => {
+      watchFile(mfile, dep);
+    });
+  });
+  b.on("bundle", (bundle) => {
+    updating = true;
+    bundle.on("error", () => void (updating = false));
+    bundle.on("end", () => void (updating = false));
+  });
+
+  function watchFile(file, dep?) {
+    dep = dep || file;
+
+    if (ignored) {
+      if (!ignoredFiles.hasOwnProperty(file)) {
+        ignoredFiles[file] = anymatch(ignored, file);
+        //anymatch(ignored, file);
+      }
+      if (ignoredFiles[file]) return;
+    }
+
+    if (!fwatchers[file]) fwatchers[file] = [];
+    if (!fwatcherFiles[file]) fwatcherFiles[file] = [];
+    if (fwatcherFiles[file].indexOf(dep) >= 0) return;
+
+    //idk how to quantify this , but adding a watcher for every dep instead of just letting the fs module do its thing seems dumb af
+    //fun fact, the node docs mentioned experimental support for fs watch on urls, can finally use a socket as a virtual fs with watch support!
+    //will try out later with vinyl ws server, there's some rollup plugin that does something similar to my vinyl hacks
+
+    //var w = b._watcher(dep, wopts);
+    var w = fs.watch(path.join(process.cwd(), "src"), { recursive: true });
+
+    w.setMaxListeners(0);
+    w.on("error", b.emit.bind(b, "error"));
+    w.on("change", function () {
+      invalidate(file);
+    });
+    fwatchers[file].push(w);
+    fwatcherFiles[file].push(dep);
+  }
+
+  function invalidate(id) {
+    if (cache) delete cache[id];
+    if (pkgcache) delete pkgcache[id];
+    changingDeps[id] = true;
+
+    if (!updating && fwatchers[id]) {
+      fwatchers[id].forEach(function (w) {
+        w.close();
+      });
+      delete fwatchers[id];
+      delete fwatcherFiles[id];
+    }
+
+    // wait for the disk/editor to quiet down first:
+    // @ts-ignore
+    if (pending) clearTimeout(pending);
+    // @ts-ignore
+    pending = setTimeout(notify, delay);
+  }
+
+  function notify() {
+    if (updating) {
+      // @ts-ignore
+      pending = setTimeout(notify, delay);
+    } else {
+      pending = false;
+      b.emit("update", Object.keys(changingDeps));
+      changingDeps = {};
+    }
+  }
+
+  b.close = () => {
+    Object.keys(fwatchers).forEach((id) => {
+      fwatchers[id].forEach((w) => {
+        w.close();
+      });
+    });
+  };
+
+  b._watcher = (file, opts) => fs.watch(file, opts);
+
+  return b;
+}
+
+watchify.args = {
+  cache: {},
+  packageCache: {},
+};
+
