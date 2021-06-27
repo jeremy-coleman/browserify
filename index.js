@@ -3427,7 +3427,7 @@ function watchify(b, opts) {
     bundle.on("end", () => void (updating = false));
   });
 
-  function watchFile(file, dep?) {
+  function watchFile(file, dep) {
     dep = dep || file;
 
     if (ignored) {
